@@ -77,6 +77,10 @@ elseif(CONFIG_BOARD_TYPE_ESP32S3_KORVO2_V3)
     set(BOARD_TYPE "esp32s3-korvo2-v3")
 elseif(CONFIG_BOARD_TYPE_ESP_SPARKBOT)
     set(BOARD_TYPE "esp-sparkbot")    
+elseif(CONFIG_BOARD_TYPE_ESP_SPOT_S3)
+    set(BOARD_TYPE "esp-spot-s3")
+elseif(CONFIG_BOARD_TYPE_ESP_SPOT_C5)
+    set(BOARD_TYPE "esp-spot-c5")
 elseif(CONFIG_BOARD_TYPE_ESP32S3_Touch_AMOLED_1_8)
     set(BOARD_TYPE "esp32-s3-touch-amoled-1.8")
 elseif(CONFIG_BOARD_TYPE_ESP32S3_Touch_LCD_1_85C)
@@ -150,6 +154,14 @@ if(CONFIG_IDF_TARGET_ESP32)
     list(REMOVE_ITEM SOURCES "audio_codecs/box_audio_codec.cc"
                              "audio_codecs/cores3_audio_codec.cc"
                              "audio_codecs/es8388_audio_codec.cc")
+endif()
+
+# 如果目标芯片是 ESP32C5，则排除特定文件
+if(CONFIG_IDF_TARGET_ESP32C5)
+    # 排除 "audio_codecs/box_audio_codec.cc" 和 "audio_codecs/tcircles3_audio_codec.cc"
+    list(REMOVE_ITEM SOURCES "audio_codecs/box_audio_codec.cc"
+                             "audio_codecs/cores3_audio_codec.cc"
+                             "audio_codecs/tcircles3_audio_codec.cc")
 endif()
 
 idf_component_register(SRCS ${SOURCES}
