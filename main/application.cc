@@ -93,7 +93,7 @@ void Application::CheckNewVersion() {
             // Use main task to do the upgrade, not cancelable
             Schedule([this, display]() {
                 SetDeviceState(kDeviceStateUpgrading);
-                
+
                 display->SetIcon(FONT_AWESOME_DOWNLOAD);
                 std::string message = std::string(Lang::Strings::NEW_VERSION) + ota_.GetFirmwareVersion();
                 display->SetChatMessage("system", message.c_str());
@@ -136,7 +136,7 @@ void Application::CheckNewVersion() {
         ota_.MarkCurrentVersionValid();
         std::string message = std::string(Lang::Strings::VERSION) + ota_.GetCurrentVersion();
         display->ShowNotification(message.c_str());
-    
+
         if (ota_.HasActivationCode()) {
             // Activation code is valid
             SetDeviceState(kDeviceStateActivating);
@@ -170,7 +170,7 @@ void Application::ShowActivationCode() {
     };
     static const std::array<digit_sound, 10> digit_sounds{{
         digit_sound{'0', Lang::Sounds::P3_0},
-        digit_sound{'1', Lang::Sounds::P3_1}, 
+        digit_sound{'1', Lang::Sounds::P3_1},
         digit_sound{'2', Lang::Sounds::P3_2},
         digit_sound{'3', Lang::Sounds::P3_3},
         digit_sound{'4', Lang::Sounds::P3_4},
@@ -279,7 +279,7 @@ void Application::StartListening() {
         ESP_LOGE(TAG, "Protocol not initialized");
         return;
     }
-    
+
     keep_listening_ = false;
     if (device_state_ == kDeviceStateIdle) {
         Schedule([this]() {
@@ -509,7 +509,7 @@ void Application::Start() {
                     wake_word_detect_.StartDetection();
                     return;
                 }
-                
+
                 std::vector<uint8_t> opus;
                 // Encode and send the wake word data to the server
                 while (wake_word_detect_.GetWakeWordOpus(opus)) {
@@ -647,7 +647,7 @@ void Application::OutputAudio() {
             output_resampler_.Process(pcm.data(), pcm.size(), resampled.data());
             pcm = std::move(resampled);
         }
-        
+
         codec->OutputData(pcm);
     });
 }
@@ -715,7 +715,7 @@ void Application::SetDeviceState(DeviceState state) {
     if (device_state_ == state) {
         return;
     }
-    
+
     clock_ticks_ = 0;
     auto previous_state = device_state_;
     device_state_ = state;
@@ -805,14 +805,14 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
         ToggleChatState();
         Schedule([this, wake_word]() {
             if (protocol_) {
-                protocol_->SendWakeWordDetected(wake_word); 
+                protocol_->SendWakeWordDetected(wake_word);
             }
-        }); 
+        });
     } else if (device_state_ == kDeviceStateSpeaking) {
         Schedule([this]() {
             AbortSpeaking(kAbortReasonNone);
         });
-    } else if (device_state_ == kDeviceStateListening) {   
+    } else if (device_state_ == kDeviceStateListening) {
         Schedule([this]() {
             if (protocol_) {
                 protocol_->CloseAudioChannel();
