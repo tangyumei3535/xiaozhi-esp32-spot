@@ -12,8 +12,11 @@
 #include <driver/gpio.h>
 #include "led_indicator.h"
 
-#define TAG "esp_spot_c5"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 
+#define TAG "esp_spot_c5"
 
 static led_indicator_handle_t led_handle = nullptr;  // **全局 LED 句柄**
 
@@ -41,6 +44,41 @@ blink_step_t const *led_modes[] = {
     [1] = breath_slow_blink,
 };
 
+
+static adc_oneshot_unit_handle_t adc1_handle;
+static adc_cali_handle_t adc1_cali_handle;
+static bool do_calibration = false;
+
+static void init_adc() {
+    adc_oneshot_unit_init_cfg_t init_config1 = {
+        .unit_id = ADC_UNIT_1
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+
+    adc_oneshot_chan_cfg_t chan_config = {
+        .atten = ADC_ATTEN,
+        .bitwidth = ADC_WIDTH,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, VBAT_ADC_CHANNEL, &chan_config));
+
+    adc_cali_handle_t handle = NULL;
+    esp_err_t ret = ESP_FAIL;
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    adc_cali_curve_fitting_config_t cali_config = {
+        .unit_id = ADC_UNIT_1,
+        .atten = ADC_ATTEN,
+        .bitwidth = ADC_WIDTH,
+    };
+    ret = adc_cali_create_scheme_curve_fitting(&cali_config, &handle);
+    if (ret == ESP_OK) {
+        do_calibration = true;
+        adc1_cali_handle = handle;
+        ESP_LOGI(TAG, "ADC Curve Fitting calibration succeeded");
+    }
+#endif
+}
+
 class SpotEs8311AudioCodec : public Es8311AudioCodec {
 private:
 
@@ -58,6 +96,7 @@ SpotEs8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port, int input_sam
         Es8311AudioCodec::EnableOutput(enable);
     }
 };
+
 
 class EspSpotC5Bot : public WifiBoard {
 private:
@@ -104,15 +143,30 @@ private:
     void InitializeIot() {
         auto& thing_manager = iot::ThingManager::GetInstance();
         thing_manager.AddThing(iot::CreateThing("Speaker"));
+        thing_manager.AddThing(iot::CreateThing("Battery"));
+    }
+
+    void InitializeGPIO() {
+        gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << POWER_CTL_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(POWER_CTL_PIN, 1);  // 拉高保持
     }
 
 public:
     Led* GetLed() override;
+    virtual bool GetBatteryLevel(int &level, bool &charging);
 
     EspSpotC5Bot() : boot_button_(BOOT_BUTTON_GPIO), key_button_(KEY_BUTTON_GPIO) {
         InitializeI2c();
         InitializeButtons();
         InitializeIot();
+        InitializeGPIO();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -166,23 +220,23 @@ private:
 
         switch (state) {
             case kDeviceStateIdle:
-                ESP_LOGI("LED", "LED Effect: OFF");
+                // ESP_LOGI("LED", "LED Effect: OFF");
                 led_indicator_set_on_off(led_handle, false);
                 break;
             case kDeviceStateConnecting:
-                ESP_LOGI("LED", "LED Effect: Triple Blink");
+                // ESP_LOGI("LED", "LED Effect: Triple Blink");
                 led_indicator_start(led_handle, 0);
                 break;
             case kDeviceStateListening:
-                ESP_LOGI("LED", "LED Effect: Breathing Slow");
+                // ESP_LOGI("LED", "LED Effect: Breathing Slow");
                 led_indicator_start(led_handle, 1);
                 break;
             case kDeviceStateSpeaking:
-                ESP_LOGI("LED", "LED Effect: ON");
+                // ESP_LOGI("LED", "LED Effect: ON");
                 led_indicator_set_on_off(led_handle, true);
                 break;
             default:
-                ESP_LOGI("LED", "LED Effect: OFF (default)");
+                // ESP_LOGI("LED", "LED Effect: OFF (default)");
                 led_indicator_set_on_off(led_handle, false);
                 break;
         }
@@ -194,4 +248,33 @@ Led* EspSpotC5Bot::GetLed() {
     return &board_led;
 }
 
-// static BoardLed board_led;
+
+bool EspSpotC5Bot::GetBatteryLevel(int &level, bool &charging) {
+    if (!adc1_handle) {
+        init_adc();
+    }
+
+    int raw_value = 0;
+    int voltage = 0;
+
+    ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, VBAT_ADC_CHANNEL, &raw_value));
+
+    if (do_calibration) {
+        ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_handle, raw_value, &voltage));
+        voltage = voltage * 3 / 2; // compensate for voltage divider
+        ESP_LOGI(TAG, "Calibrated voltage: %d mV", voltage);
+    } else {
+        ESP_LOGI(TAG, "Raw ADC value: %d", raw_value);
+        voltage = raw_value;
+    }
+
+    voltage = voltage < EMPTY_BATTERY_VOLTAGE ? EMPTY_BATTERY_VOLTAGE : voltage;
+    voltage = voltage > FULL_BATTERY_VOLTAGE ? FULL_BATTERY_VOLTAGE : voltage;
+
+    // 计算电量百分比
+    level = (voltage - EMPTY_BATTERY_VOLTAGE) * 100 / (FULL_BATTERY_VOLTAGE - EMPTY_BATTERY_VOLTAGE);
+
+    charging = gpio_get_level(POWER_CTL_PIN);
+    ESP_LOGI(TAG, "Battery Level: %d%%, Charging: %s", level, charging ? "Yes" : "No");
+    return true;
+}
