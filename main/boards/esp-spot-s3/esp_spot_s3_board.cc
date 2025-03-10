@@ -14,7 +14,15 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 
+#include <driver/gpio.h>
+#include "esp_timer.h"
+#include "led/circular_strip.h"
+
 #define TAG "esp_spot_s3"
+
+bool button_released_ = false;
+bool shutdown_ready_ = false;
+esp_timer_handle_t shutdown_timer;
 
 class SpotEs8311AudioCodec : public Es8311AudioCodec {
 private:
@@ -33,7 +41,7 @@ SpotEs8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port, int input_sam
         Es8311AudioCodec::EnableOutput(enable);
     }
 };
-    
+
 class EspSpotS3Bot : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
@@ -42,6 +50,9 @@ private:
     adc_oneshot_unit_handle_t adc1_handle;
     adc_cali_handle_t adc1_cali_handle;
     bool do_calibration = false;
+    bool key_long_pressed = false;
+    int64_t last_key_press_time = 0;
+    static const int64_t LONG_PRESS_TIMEOUT_US = 5 * 1000000ULL;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -65,16 +76,16 @@ private:
             .unit_id = ADC_UNIT_1
         };
         ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
-    
+
         adc_oneshot_chan_cfg_t chan_config = {
             .atten = ADC_ATTEN,
             .bitwidth = ADC_WIDTH,
         };
         ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, VBAT_ADC_CHANNEL, &chan_config));
-    
+
         adc_cali_handle_t handle = NULL;
         esp_err_t ret = ESP_FAIL;
-    
+
 #if CONFIG_ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
         adc_cali_curve_fitting_config_t cali_config = {
             .unit_id = ADC_UNIT_1,
@@ -93,46 +104,117 @@ private:
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                ResetWifiConfiguration();
-            }
-            app.ToggleChatState();
+            ResetWifiConfiguration();
         });
+
         key_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                ResetWifiConfiguration();
-            }
             app.ToggleChatState();
+            key_long_pressed = false;
+        });
+
+        key_button_.OnLongPress([this]() {
+            int64_t now = esp_timer_get_time();
+            auto* led = static_cast<CircularStrip*>(this->GetLed());
+
+            if (key_long_pressed) {
+                if ((now - last_key_press_time) < LONG_PRESS_TIMEOUT_US) {
+                    ESP_LOGW(TAG, "Key button long pressed the second time within 5s, shutting down...");
+                    led->SetSingleColor(0, {0, 0, 0});
+
+                    gpio_hold_dis(MCU_VCC_CTL);
+                    gpio_set_level(MCU_VCC_CTL, 0);
+
+                } else {
+                    last_key_press_time = now;
+                    BlinkGreenFor5s();
+                }
+                key_long_pressed = true;
+            } else {
+                ESP_LOGW(TAG, "Key button first long press! Waiting second within 5s to shutdown...");
+                last_key_press_time = now;
+                key_long_pressed = true;
+
+                BlinkGreenFor5s();
+            }
         });
     }
 
+    void InitializePowerCtl() {
+        InitializeGPIO();
+
+        gpio_set_level(MCU_VCC_CTL, 1);
+        gpio_hold_en(MCU_VCC_CTL);
+
+        gpio_set_level(PERP_VCC_CTL, 1);
+        gpio_hold_en(PERP_VCC_CTL);
+    }
+
     void InitializeGPIO() {
-        gpio_config_t io_conf = {
-            .pin_bit_mask = (1ULL << POWER_CTL_PIN),
+        gpio_config_t io_conf_1 = {
+            .pin_bit_mask = (1ULL << MCU_VCC_CTL),
             .mode = GPIO_MODE_OUTPUT,
             .pull_up_en = GPIO_PULLUP_DISABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE
         };
-        gpio_config(&io_conf);
-        gpio_set_level(POWER_CTL_PIN, 1);  // 拉高保持
+        gpio_config(&io_conf_1);
+
+        gpio_config_t io_conf_2 = {
+            .pin_bit_mask = (1ULL << PERP_VCC_CTL),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE
+        };
+        gpio_config(&io_conf_2);
     }
 
-    // 物联网初始化，添加对 AI 可见设备
     void InitializeIot() {
         auto& thing_manager = iot::ThingManager::GetInstance();
         thing_manager.AddThing(iot::CreateThing("Speaker"));
         thing_manager.AddThing(iot::CreateThing("Battery"));
     }
 
+
+    void BlinkGreenFor5s() {
+        auto* led = static_cast<CircularStrip*>(GetLed());
+        if (!led) {
+            return;
+        }
+
+        led->Blink({50, 25, 0}, 100);
+
+        esp_timer_create_args_t timer_args = {
+            .callback = [](void* arg) {
+                auto* self = static_cast<EspSpotS3Bot*>(arg);
+                auto* led = static_cast<CircularStrip*>(self->GetLed());
+                if (led) {
+                    led->SetSingleColor(0, {0, 0, 0});
+                }
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "blinkGreenFor5s_timer"
+        };
+
+        esp_timer_handle_t blink_timer = nullptr;
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &blink_timer));
+        ESP_ERROR_CHECK(esp_timer_start_once(blink_timer, LONG_PRESS_TIMEOUT_US));
+    }
+
 public:
     EspSpotS3Bot() : boot_button_(BOOT_BUTTON_GPIO), key_button_(KEY_BUTTON_GPIO, true) {
-        InitializeGPIO();
+        InitializePowerCtl();
         InitializeADC();
         InitializeI2c();
         InitializeButtons();
         InitializeIot();
+    }
+
+    virtual Led* GetLed() override {
+        static CircularStrip led(LED_PIN, 1);
+        return &led;
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -146,12 +228,12 @@ public:
         if (!adc1_handle) {
             InitializeADC();
         }
-    
+
         int raw_value = 0;
         int voltage = 0;
-    
+
         ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, VBAT_ADC_CHANNEL, &raw_value));
-    
+
         if (do_calibration) {
             ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_handle, raw_value, &voltage));
             voltage = voltage * 3 / 2; // compensate for voltage divider
@@ -160,14 +242,14 @@ public:
             ESP_LOGI(TAG, "Raw ADC value: %d", raw_value);
             voltage = raw_value;
         }
-    
+
         voltage = voltage < EMPTY_BATTERY_VOLTAGE ? EMPTY_BATTERY_VOLTAGE : voltage;
         voltage = voltage > FULL_BATTERY_VOLTAGE ? FULL_BATTERY_VOLTAGE : voltage;
-    
+
         // 计算电量百分比
         level = (voltage - EMPTY_BATTERY_VOLTAGE) * 100 / (FULL_BATTERY_VOLTAGE - EMPTY_BATTERY_VOLTAGE);
-    
-        charging = gpio_get_level(POWER_CTL_PIN);
+
+        charging = gpio_get_level(MCU_VCC_CTL);
         ESP_LOGI(TAG, "Battery Level: %d%%, Charging: %s", level, charging ? "Yes" : "No");
         return true;
     }
