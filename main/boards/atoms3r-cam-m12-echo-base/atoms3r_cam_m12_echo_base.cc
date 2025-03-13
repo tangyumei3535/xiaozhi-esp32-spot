@@ -11,6 +11,11 @@
 #include <driver/i2c_master.h>
 #include <wifi_station.h>
 
+#include "human_face_detect.hpp"
+#include "freertos/FreeRTOS.h"
+#include "esp_camera.h"
+
+
 #define TAG "AtomS3R M12+EchoBase"
 
 #define PI4IOE_ADDR          0x43
@@ -19,6 +24,60 @@
 #define PI4IOE_REG_IO_DIR    0x03
 #define PI4IOE_REG_IO_OUT    0x05
 #define PI4IOE_REG_IO_PULLUP 0x0D
+
+/* Face Detect */
+
+static HumanFaceDetect *detect_ = new HumanFaceDetect();
+static bool camera_inited_ = false;
+static TaskHandle_t face_detect_task_handle_ = nullptr;
+static int face_num_ = -1;
+
+static void FaceRecognizerTask (void * pvParameters) {
+    while (camera_inited_) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (fb == NULL) {
+            printf("Camera frame failed\n");
+            face_num_ = -1;
+            vTaskDelay(10000 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        if (fb->format != PIXFORMAT_RGB565) {
+            face_num_ = -1;
+            esp_camera_fb_return(fb);
+            vTaskDelay(10000 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        dl::image::img_t img = {
+            .data     = fb->buf,
+            .width    = static_cast<int>(fb->width),
+            .height   = static_cast<int>(fb->height),
+            .pix_type = dl::image::pix_type_t::DL_IMAGE_PIX_TYPE_RGB565
+        };
+
+        auto result = detect_->run(img);
+
+        if (face_num_ == 0 && result.size() > 0) {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == DeviceState::kDeviceStateIdle) {
+                ESP_LOGI(TAG, "Wake!");
+                app.WakeWordInvoke("你好");
+            }
+        }
+
+        face_num_ = result.size();
+        // std::cout << "num: " << face_num_ << "\n";
+
+        esp_camera_fb_return(fb);
+
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+    ESP_LOGI(TAG, "Face Recognizer Task end.");
+    face_num_ = -1;
+    vTaskDelete(face_detect_task_handle_);
+}
+
 
 class Pi4ioe : public I2cDevice {
 public:
@@ -125,6 +184,89 @@ private:
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
+    esp_err_t InitializeCamera() {
+        if (camera_inited_) {
+            ESP_LOGD(TAG, "camera already inited");
+            return ESP_OK;
+        }
+
+        camera_config_t camera_config = {
+            .pin_pwdn     = CAMERA_PIN_PWDN,
+            .pin_reset    = CAMERA_PIN_RESET,
+            .pin_xclk     = CAMERA_PIN_XCLK,
+            .pin_sscb_sda = CAMERA_PIN_SIOD,
+            .pin_sscb_scl = CAMERA_PIN_SIOC,
+
+            .pin_d7    = CAMERA_PIN_D7,
+            .pin_d6    = CAMERA_PIN_D6,
+            .pin_d5    = CAMERA_PIN_D5,
+            .pin_d4    = CAMERA_PIN_D4,
+            .pin_d3    = CAMERA_PIN_D3,
+            .pin_d2    = CAMERA_PIN_D2,
+            .pin_d1    = CAMERA_PIN_D1,
+            .pin_d0    = CAMERA_PIN_D0,
+            .pin_vsync = CAMERA_PIN_VSYNC,
+            .pin_href  = CAMERA_PIN_HREF,
+            .pin_pclk  = CAMERA_PIN_PCLK,
+
+            .xclk_freq_hz = CAMERA_XCLK_FREQ,
+            .ledc_timer   = LEDC_TIMER_0,
+            .ledc_channel = LEDC_CHANNEL_0,
+
+            .pixel_format = PIXFORMAT_RGB565,
+            .frame_size   = FRAMESIZE_QVGA,
+
+            .jpeg_quality = 6,
+            .fb_count     = 1,
+            .fb_location  = CAMERA_FB_IN_PSRAM,
+            .grab_mode    = CAMERA_GRAB_WHEN_EMPTY,
+        };
+
+        // initialize the camera sensor
+        esp_err_t ret = esp_camera_init(&camera_config);
+        ESP_LOGI(TAG, "Camera sensor initialized: %d (%s)", ret, esp_err_to_name(ret));
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+        // Get the sensor object, and then use some of its functions to adjust the parameters when taking a photo.
+        // Note: Do not call functions that set resolution, set picture format and PLL clock,
+        // If you need to reset the appeal parameters, please reinitialize the sensor.
+        sensor_t* s = esp_camera_sensor_get();
+        s->set_vflip(s, 1);  // flip it back
+        // initial sensors are flipped vertically and colors are a bit saturated
+        if (s->id.PID == OV3660_PID) {
+            s->set_brightness(s, 1);   // up the blightness just a bit
+            s->set_saturation(s, -2);  // lower the saturation
+        }
+
+        if (s->id.PID == OV3660_PID || s->id.PID == OV2640_PID) {
+            s->set_vflip(s, 1);  // flip it back
+        } else if (s->id.PID == GC0308_PID) {
+            s->set_hmirror(s, 0);
+        } else if (s->id.PID == GC032A_PID) {
+            s->set_vflip(s, 1);
+        }
+
+        camera_inited_ = true;
+
+        return ret;
+    }
+
+    void StartFaceDetectTask() {
+        if (face_detect_task_handle_) {
+            ESP_LOGE(TAG, "Face Recognizer Task is already started!");
+            return;
+        }
+        BaseType_t xReturnd = xTaskCreate(FaceRecognizerTask, "FaceRecognizerTask", 6144, nullptr, 0, &face_detect_task_handle_);
+
+        if (xReturnd != pdTRUE) {
+            ESP_LOGE(TAG, "FaceRecognizerTask start failed!");
+        } else {
+            ESP_LOGI(TAG, "FaceRecognizerTask start");
+        }
+    }
+
     // 物联网初始化，添加对 AI 可见设备
     void InitializeIot() {
         auto& thing_manager = iot::ThingManager::GetInstance();
@@ -139,6 +281,8 @@ public:
         CheckEchoBaseConnection();
         InitializePi4ioe();
         InitializeIot();
+        InitializeCamera();
+        StartFaceDetectTask();
     }
 
     virtual AudioCodec* GetAudioCodec() override {

@@ -12,7 +12,9 @@
 
 AtomS3R CAM、AtomS3R M12 是 M5Stack 推出的基于 ESP32-S3-PICO-1-N8R8 的物联网可编程控制器，搭载了摄像头。Atomic Echo Base 是一款专为 M5 Atom 系列主机设计的语音识别底座，采用了 ES8311 单声道音频解码器、MEMS 麦克风和 NS4150B 功率放大器的集成方案。
 
-两款开发版均**不带屏幕、不带额外按键**，需要使用语音唤醒。必要时，需要使用 `idf.py monitor` 查看 log 以确定运行状态。
+这两款均支持人脸唤醒功能，摄像头识别到人脸后会自动唤醒。注意：人脸唤醒功能需要摄像头图像为正向，AtomS3R Cam 需要 USB Type-C 口朝下，AtomS3R M12 需要 USB Type-C 口朝左且摄像头距离人脸约 17 cm。
+
+两款开发版均**不带屏幕、不带额外按键**，需要使用语音唤醒或人脸唤醒。必要时，需要使用 `idf.py monitor` 查看 log 以确定运行状态。
 
 ## 配置、编译命令
 
@@ -31,7 +33,7 @@ idf.py menuconfig
 分别配置如下选项：
 
 - `Xiaozhi Assistant` → `Board Type` → 选择 `AtomS3R CAM/M12 + Echo Base`
-- `Partition Table` → `Custom partition CSV file` → 删除原有内容，输入 `partitions_8M.csv`
+- `Partition Table` → `Custom partition CSV file` → 删除原有内容，输入 `partitions_8M_face_det.csv`
 - `Serial flasher config` → `Flash size` → 选择 `8 MB`
 
 按 `S` 保存，按 `Q` 退出。
