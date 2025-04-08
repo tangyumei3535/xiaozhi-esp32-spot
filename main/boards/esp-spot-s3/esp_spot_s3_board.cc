@@ -8,30 +8,40 @@
 
 #include <wifi_station.h>
 #include <esp_log.h>
-#include <driver/i2c_master.h>
+#include <driver/i2c_types.h>
 #include <driver/spi_common.h>
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "bmi270.h"
+#include "i2c_bus.h"
 
 #include <driver/gpio.h>
 #include "esp_timer.h"
 #include "led/circular_strip.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #define TAG "esp_spot_s3"
 
-bool button_released_ = false;
-bool shutdown_ready_ = false;
-esp_timer_handle_t shutdown_timer;
+#ifdef IMU_DEBUG
+#include "array"
+#include "string_view"
+#endif // IMU_DEBUG
+
+static bool button_released_ = false;
+static bool shutdown_ready_ = false;
+static esp_timer_handle_t shutdown_timer_;
 
 class SpotEs8311AudioCodec : public Es8311AudioCodec {
 private:
 
 public:
-SpotEs8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port, int input_sample_rate, int output_sample_rate,
+SpotEs8311AudioCodec(i2c_bus_handle_t i2c_bus_handle, i2c_port_t i2c_port, int input_sample_rate, int output_sample_rate,
                         gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
                         gpio_num_t pa_pin, uint8_t es8311_addr, bool use_mclk = true)
-        : Es8311AudioCodec(i2c_master_handle, i2c_port, input_sample_rate, output_sample_rate,
+        : Es8311AudioCodec(i2c_bus_get_internal_bus_handle(i2c_bus_handle), i2c_port, input_sample_rate, output_sample_rate,
                                 mclk,  bclk,  ws,  dout,  din,pa_pin,  es8311_addr,  use_mclk = false) {}
 
     void EnableOutput(bool enable) override {
@@ -42,9 +52,148 @@ SpotEs8311AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port, int input_sam
     }
 };
 
+namespace Bmi270Imu {
+
+static bmi270_handle_t bmi_handle_ = nullptr;
+static struct bmi2_feat_sensor_data sens_data_ = { .type = BMI2_WRIST_GESTURE };
+static TaskHandle_t imu_task_handle_ = nullptr;
+
+static void IRAM_ATTR ImuIsrHandler(void* arg)
+{
+    vTaskNotifyGiveFromISR(imu_task_handle_, NULL);
+}
+
+esp_err_t Initialize(i2c_bus_handle_t i2c_bus, uint8_t addr = BMI270_I2C_ADDRESS) {
+    bmi270_i2c_config_t i2c_bmi270_conf = {
+        .i2c_handle = i2c_bus,
+        .i2c_addr = addr,
+    };
+
+    int8_t rslt = bmi270_sensor_create(&i2c_bmi270_conf, &bmi_handle_);
+    if (rslt != BMI2_OK || !bmi_handle_) {
+        ESP_LOGE(TAG, "BMI270 create failed: %d", rslt);
+        return ESP_FAIL;
+    }
+
+    uint8_t sens_list[] = {BMI2_ACCEL, BMI2_WRIST_GESTURE};
+    rslt = bmi270_sensor_enable(sens_list, 2, bmi_handle_);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Sensor enable failed: %d", rslt);
+        return ESP_FAIL;
+    }
+
+    struct bmi2_sens_config config = {.type = BMI2_WRIST_GESTURE};
+    rslt = bmi270_get_sensor_config(&config, 1, bmi_handle_);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Get config failed: %d", rslt);
+        return ESP_FAIL;
+    }
+    config.cfg.wrist_gest.wearable_arm = BMI2_ARM_LEFT;
+    rslt = bmi270_set_sensor_config(&config, 1, bmi_handle_);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Set config failed: %d", rslt);
+        return ESP_FAIL;
+    }
+
+    struct bmi2_sens_int_config sens_int = {
+        .type = BMI2_WRIST_GESTURE,
+        .hw_int_pin = BMI2_INT1
+    };
+    rslt = bmi270_map_feat_int(&sens_int, 1, bmi_handle_);
+
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Map interrupt failed: %d", rslt);
+        return ESP_FAIL;
+    }
+
+    struct bmi2_int_pin_config pin_config = { 0 };
+    rslt = bmi2_get_int_pin_config(&pin_config, bmi_handle_);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Get int pin config failed: %d", rslt);
+        return ESP_FAIL;
+    }
+
+    pin_config.pin_type = BMI2_INT1;
+    pin_config.pin_cfg[0].input_en = BMI2_INT_INPUT_DISABLE;
+    pin_config.pin_cfg[0].lvl = BMI2_INT_ACTIVE_LOW;
+    pin_config.pin_cfg[0].od = BMI2_INT_PUSH_PULL;
+    pin_config.pin_cfg[0].output_en = BMI2_INT_OUTPUT_ENABLE;
+    pin_config.int_latch = BMI2_INT_NON_LATCH;
+
+    rslt = bmi2_set_int_pin_config(&pin_config, bmi_handle_);
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "Set int pin config failed: %d", rslt);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Gesture detection initialized");
+    return ESP_OK;
+}
+
+bmi270_handle_t GetBmiHandle() {
+    if(!bmi_handle_) {
+        ESP_LOGE(TAG, "BMI Sensor has not been inited.");
+    }
+    return bmi_handle_;
+}
+
+uint8_t GetBmiStatus() {
+    if(!bmi_handle_) {
+        return 0;
+        ESP_LOGW(TAG, "IMU is not inited!");
+    }
+    uint16_t status = 0;
+    bmi2_get_int_status(&status, bmi_handle_);
+    if (status & BMI270_WRIST_GEST_STATUS_MASK) {
+        bmi270_get_feature_data(&sens_data_, 1, bmi_handle_);
+        uint8_t gesture = sens_data_.sens_data.wrist_gesture_output;
+#ifdef IMU_DEBUG
+        constexpr std::array<std::string_view, 6> GUSTURE_LIST = {
+            "unknown", "push_arm_down", "pivot_up",
+            "wrist_shake_jiggle", "flick_in", "flick_out"
+        };
+        ESP_LOGI(TAG, "Detected gesture: %s", GUSTURE_LIST[gesture]);
+#endif // IMU_DEBUG
+        return gesture;
+    }
+    return 0;
+}
+
+void ImuTask(void *arg) {
+    ESP_LOGI(TAG, "ImuTask Started!");
+    uint16_t int_status = 0;
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    while(true) {
+        if (!bmi_handle_) {
+            ESP_LOGW(TAG, "bmi_handle_ is NULL");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        ESP_LOGI(TAG, "Waiting for IMU interrupt...");
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ESP_LOGI(TAG, "IMU interrupt received!");
+        if (GetBmiStatus() == 3) {
+            auto& app = Application::GetInstance();
+            auto device_state = app.GetDeviceState();
+            if (device_state == kDeviceStateListening) {
+                app.StopListening();
+            } else if (device_state == kDeviceStateSpeaking) {
+                app.AbortSpeaking(kAbortReasonNone);
+            }
+        }
+    }
+    ESP_LOGE(TAG, "ImuTask Stoped!");
+    vTaskDelete(NULL);
+}
+
+}
+
 class EspSpotS3Bot : public WifiBoard {
 private:
-    i2c_master_bus_handle_t i2c_bus_;
+    i2c_bus_handle_t i2c_bus_ = nullptr;
+    // 为了兼容 BMI270 IMU 驱动，这里使用 i2c_bus 组件的 i2c_bus_handle，
+    // 可以使用 `i2c_bus_get_internal_bus_handle(i2c_bus_)`
+    // 获取 i2c_master_bus_handle_t 的 i2c_bus
     Button boot_button_;
     Button key_button_;
     adc_oneshot_unit_handle_t adc1_handle;
@@ -55,20 +204,21 @@ private:
     static const int64_t LONG_PRESS_TIMEOUT_US = 5 * 1000000ULL;
 
     void InitializeI2c() {
-        // Initialize I2C peripheral
-        i2c_master_bus_config_t i2c_bus_cfg = {
-            .i2c_port = I2C_NUM_0,
+        const i2c_config_t i2c_bus_conf = {
+            .mode = I2C_MODE_MASTER,
             .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
             .scl_io_num = AUDIO_CODEC_I2C_SCL_PIN,
-            .clk_source = I2C_CLK_SRC_DEFAULT,
-            .glitch_ignore_cnt = 7,
-            .intr_priority = 0,
-            .trans_queue_depth = 0,
-            .flags = {
-                .enable_internal_pullup = 1,
-            },
+            .sda_pullup_en = GPIO_PULLUP_ENABLE,
+            .scl_pullup_en = GPIO_PULLUP_ENABLE,
+            .master = {
+                .clk_speed = I2C_MASTER_FREQ_HZ
+            }
         };
-        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
+        i2c_bus_ = i2c_bus_create(I2C_NUM_0, &i2c_bus_conf);
+        if (!i2c_bus_) {
+            ESP_LOGE(TAG, "I2C bus create failed");
+            abort();
+        }
     }
 
     void InitializeADC() {
@@ -83,10 +233,9 @@ private:
         };
         ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, VBAT_ADC_CHANNEL, &chan_config));
 
+#if CONFIG_ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
         adc_cali_handle_t handle = NULL;
         esp_err_t ret = ESP_FAIL;
-
-#if CONFIG_ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
         adc_cali_curve_fitting_config_t cali_config = {
             .unit_id = ADC_UNIT_1,
             .atten = ADC_ATTEN,
@@ -103,7 +252,7 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
-            auto& app = Application::GetInstance();
+            // auto& app = Application::GetInstance();
             ResetWifiConfiguration();
         });
 
@@ -168,6 +317,17 @@ private:
             .intr_type = GPIO_INTR_DISABLE
         };
         gpio_config(&io_conf_2);
+
+        gpio_config_t io_conf_imu_int = {
+            .pin_bit_mask = (1ULL << IMU_INT_GPIO),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_ENABLE,
+            .intr_type = GPIO_INTR_NEGEDGE,
+        };
+        gpio_config(&io_conf_imu_int);
+        gpio_install_isr_service(0);
+        gpio_isr_handler_add(IMU_INT_GPIO, Bmi270Imu::ImuIsrHandler, nullptr);
     }
 
     void InitializeIot() {
@@ -175,7 +335,6 @@ private:
         thing_manager.AddThing(iot::CreateThing("Speaker"));
         thing_manager.AddThing(iot::CreateThing("Battery"));
     }
-
 
     void BlinkGreenFor5s() {
         auto* led = static_cast<CircularStrip*>(GetLed());
@@ -203,11 +362,17 @@ private:
         ESP_ERROR_CHECK(esp_timer_start_once(blink_timer, LONG_PRESS_TIMEOUT_US));
     }
 
+    void StartImuTask() {
+        int ret = xTaskCreate(Bmi270Imu::ImuTask, "imu_task", 3096, nullptr, 1, &Bmi270Imu::imu_task_handle_);
+    }
+
 public:
     EspSpotS3Bot() : boot_button_(BOOT_BUTTON_GPIO), key_button_(KEY_BUTTON_GPIO, true) {
         InitializePowerCtl();
-        InitializeADC();
         InitializeI2c();
+        InitializeADC();
+        StartImuTask();
+        Bmi270Imu::Initialize(i2c_bus_);
         InitializeButtons();
         InitializeIot();
     }

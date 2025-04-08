@@ -26,10 +26,15 @@
 #define VBAT_ADC_CHANNEL         ADC_CHANNEL_9  // S3: IO10
 #define MCU_VCC_CTL              GPIO_NUM_4     // set 1 to power on MCU
 #define PERP_VCC_CTL             GPIO_NUM_6     // set 1 to power on peripherals
+#define IMU_INT_GPIO             GPIO_NUM_5
 
 #define ADC_ATTEN                ADC_ATTEN_DB_12
 #define ADC_WIDTH                ADC_BITWIDTH_DEFAULT
 #define FULL_BATTERY_VOLTAGE     4100
 #define EMPTY_BATTERY_VOLTAGE    3200
+
+#define I2C_MASTER_FREQ_HZ      (100 * 1000)
+
+#define IMU_DEBUG
 
 #endif // _BOARD_CONFIG_H_
